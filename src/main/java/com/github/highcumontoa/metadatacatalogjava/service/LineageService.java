@@ -1,0 +1,200 @@
+package com.github.highcumontoa.metadatacatalogjava.service;
+
+import com.github.highcumontoa.metadatacatalogjava.dto.ImpactResult;
+import com.github.highcumontoa.metadatacatalogjava.dto.LineageRequest;
+import com.github.highcumontoa.metadatacatalogjava.dto.LineageResult;
+import com.github.highcumontoa.metadatacatalogjava.model.ActionType;
+import com.github.highcumontoa.metadatacatalogjava.model.Decision;
+import com.github.highcumontoa.metadatacatalogjava.model.LineageEdge;
+import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
+import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * 血缘登记、环检测与多跳影响查询服务。
+ *
+ * <p>规则：</p>
+ * <ol>
+ *   <li>上下游实体必须均已登记，否则 UNKNOWN_ENTITY；</li>
+ *   <li>自引用（upstream == downstream）以 SELF_REFERENCE 拒绝；</li>
+ *   <li>若 downstream 已能沿既有血缘到达 upstream，则新增 upstream->downstream 成环，
+ *       以 CYCLE_DETECTED 拒绝，并给出可达路径作为依据；</li>
+ *   <li>相同的边重复登记结论为 NO_CHANGE，不重复计数；</li>
+ *   <li>环检测与写入在全局 lineageLock 下完成，保证并发下结论确定；</li>
+ *   <li>下游影响按跳数分层返回；图中既有的异常环通过 cycleMarked 显式标记。</li>
+ * </ol>
+ */
+@Service
+public class LineageService {
+
+    private static final Logger log = LoggerFactory.getLogger(LineageService.class);
+
+    private final LocalMetadataStore store;
+    private final PermissionService permissionService;
+
+    public LineageService(LocalMetadataStore store, PermissionService permissionService) {
+        this.store = store;
+        this.permissionService = permissionService;
+    }
+
+    public LineageResult registerLineage(LineageRequest request) {
+        log.info("[LINEAGE] 输入 source={}, upstream={}, downstream={}",
+                request == null ? null : request.source(),
+                request == null ? null : request.upstream(),
+                request == null ? null : request.downstream());
+
+        if (request == null || isBlank(request.upstream()) || isBlank(request.downstream())) {
+            return reject(request, RejectReason.INVALID_PAYLOAD,
+                    "upstream 与 downstream 均为必填项");
+        }
+        String source = isBlank(request.source()) ? "anonymous" : request.source().trim();
+        String upstream = request.upstream().trim();
+        String downstream = request.downstream().trim();
+
+        store.lineageLock().lock();
+        try {
+            if (store.getEntity(upstream) == null || store.getEntity(downstream) == null) {
+                return reject(request, RejectReason.UNKNOWN_ENTITY,
+                        "上下游实体必须均已登记：upstream=" + upstream + ", downstream=" + downstream);
+            }
+            if (upstream.equals(downstream)) {
+                return reject(request, RejectReason.SELF_REFERENCE,
+                        "拒绝自引用血缘：" + upstream + " -> " + downstream);
+            }
+            if (!permissionService.canWrite(downstream, source)
+                    || !permissionService.canWrite(upstream, source)) {
+                return reject(request, RejectReason.PERMISSION_DENIED,
+                        "来源/操作者 '" + source + "' 对血缘涉及实体无写权限");
+            }
+            if (store.lineageExists(upstream, downstream)) {
+                LineageResult result = new LineageResult(upstream, downstream, Decision.NO_CHANGE,
+                        RejectReason.NONE, "该血缘此前已登记，幂等返回，不重复计数");
+                store.appendAudit(ActionType.REGISTER_LINEAGE, source,
+                        upstream + "->" + downstream, Decision.NO_CHANGE, RejectReason.NONE,
+                        "重复登记血缘，忽略");
+                log.info("[LINEAGE] 结论 {}->{} decision=NO_CHANGE 依据=边已存在", upstream, downstream);
+                return result;
+            }
+            List<String> existingPath = findPath(downstream, upstream);
+            if (existingPath != null) {
+                String msg = "登记 " + upstream + "->" + downstream + " 将形成环；既有可达路径："
+                        + String.join(" -> ", existingPath);
+                LineageResult result = new LineageResult(upstream, downstream, Decision.REJECTED,
+                        RejectReason.CYCLE_DETECTED, msg);
+                store.appendAudit(ActionType.REGISTER_LINEAGE, source,
+                        upstream + "->" + downstream, Decision.REJECTED, RejectReason.CYCLE_DETECTED, msg);
+                log.info("[LINEAGE] 结论 {}->{} decision=REJECTED reason=CYCLE_DETECTED 依据={}",
+                        upstream, downstream, msg);
+                return result;
+            }
+
+            store.addLineage(new LineageEdge(upstream, downstream, source));
+            LineageResult result = new LineageResult(upstream, downstream, Decision.ACCEPTED,
+                    RejectReason.NONE, "血缘登记成功");
+            store.appendAudit(ActionType.REGISTER_LINEAGE, source,
+                    upstream + "->" + downstream, Decision.ACCEPTED, RejectReason.NONE,
+                    "新增血缘 " + upstream + "->" + downstream);
+            log.info("[LINEAGE] 结论 {}->{} decision=ACCEPTED 依据=新边且不构成环", upstream, downstream);
+            return result;
+        } finally {
+            store.lineageLock().unlock();
+        }
+    }
+
+    /** 下游多跳影响：BFS 按跳数分层；若遍历中遇到已访问层级之外的回边，则标记 cycleMarked。 */
+    public ImpactResult downstreamImpact(String qualifiedName) {
+        log.info("[IMPACT] 输入 origin={}", qualifiedName);
+        if (isBlank(qualifiedName) || store.getEntity(qualifiedName) == null) {
+            throw new IllegalArgumentException("实体不存在或名称为空：" + qualifiedName);
+        }
+        Map<Integer, List<String>> hopsMap = new LinkedHashMap<>();
+        Set<String> visited = new LinkedHashSet<>();
+        visited.add(qualifiedName);
+        boolean[] cycle = {false};
+
+        Deque<String> queue = new ArrayDeque<>();
+        Deque<Integer> distQueue = new ArrayDeque<>();
+        queue.add(qualifiedName);
+        distQueue.add(0);
+
+        while (!queue.isEmpty()) {
+            String node = queue.poll();
+            int dist = distQueue.poll();
+            for (String next : store.downstreamOf(node).stream().sorted().toList()) {
+                if (visited.contains(next)) {
+                    // 指向已访问节点（含回指 origin）说明图中存在环
+                    cycle[0] = true;
+                    continue;
+                }
+                visited.add(next);
+                int nextDist = dist + 1;
+                hopsMap.computeIfAbsent(nextDist, k -> new ArrayList<>()).add(next);
+                queue.add(next);
+                distQueue.add(nextDist);
+            }
+        }
+
+        List<ImpactResult.Hop> hops = new ArrayList<>();
+        hopsMap.forEach((distance, entities) -> hops.add(new ImpactResult.Hop(distance,
+                        entities.stream().sorted().toList())));
+        log.info("[IMPACT] origin={} 结论 hops={}, cycleMarked={}", qualifiedName, hops, cycle[0]);
+        return new ImpactResult(qualifiedName, List.copyOf(hops), cycle[0]);
+    }
+
+    /** 从 from 到 to 的一条可达路径（BFS），不可达返回 null；在 lineageLock 下调用。 */
+    private List<String> findPath(String from, String to) {
+        if (from.equals(to)) {
+            return List.of(from);
+        }
+        Deque<String> queue = new ArrayDeque<>();
+        Map<String, String> parent = new LinkedHashMap<>();
+        queue.add(from);
+        parent.put(from, null);
+        while (!queue.isEmpty()) {
+            String node = queue.poll();
+            for (String next : store.downstreamOf(node).stream().sorted().toList()) {
+                if (parent.containsKey(next)) {
+                    continue;
+                }
+                parent.put(next, node);
+                if (next.equals(to)) {
+                    List<String> path = new ArrayList<>();
+                    String cur = to;
+                    while (cur != null) {
+                        path.add(0, cur);
+                        cur = parent.get(cur);
+                    }
+                    return path;
+                }
+                queue.add(next);
+            }
+        }
+        return null;
+    }
+
+    private LineageResult reject(LineageRequest request, RejectReason reason, String message) {
+        String up = request == null ? null : request.upstream();
+        String down = request == null ? null : request.downstream();
+        String source = request == null || isBlank(request.source()) ? "anonymous" : request.source().trim();
+        LineageResult result = new LineageResult(up, down, Decision.REJECTED, reason, message);
+        store.appendAudit(ActionType.REGISTER_LINEAGE, source,
+                up + "->" + down, Decision.REJECTED, reason, message);
+        log.info("[LINEAGE] 结论 {}->{} decision=REJECTED reason={} 依据={}", up, down, reason, message);
+        return result;
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
+    }
+}
