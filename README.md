@@ -19,10 +19,17 @@
 | 类型 | 含义 |
 | --- | --- |
 | `EntityDef` | 实体，按 **qualifiedName（限定名）** 归一；种类为 `TABLE / VIEW / STREAM`；持有字段集合、声明来源集合、`deprecated` 标志 |
-| `FieldDef` | 字段：`name`、**canonicalType（规范类型）**、`sources`（来源 -> 该来源声称的原始类型）、`deprecated` |
+| `FieldDef` | 字段：`name`、**canonicalType（规范类型）**、`sources`（生效来源 -> 其原始类型）、`rejectedClaims`（拒绝台账：落败来源 -> 其原始类型）、`deprecated` |
 | `DataType` | 统一规范类型枚举：`INTEGER / BIGINT / DECIMAL / DOUBLE / STRING / BOOLEAN / TIMESTAMP` |
 | `LineageEdge` | 有向血缘记录 `(upstream, downstream, source)` |
 | `AuditRecord` | 只追加审计：单调序号、时间戳、动作、操作者、目标实体、结论、拒绝原因、明细 |
+
+### 1.0 对象名归一（`NameNormalizer`）
+
+所有写入口（登记、字段变更、血缘登记、废弃、移除）与读路径使用**同一套归一规则**识别对象：
+去掉首尾空白并按 `Locale.ROOT` 转小写。因此实体名 / 字段名仅大小写或首尾空白不同
+（如 `" ODS.User "` 与 `"ods.user"`、`" ID"` 与 `"id"`）时，**必然被当成同一个对象**：
+不会各自建一份定义，也不会各算一套血缘；权限授权、审计查询同样按归一后的名字匹配。
 
 ### 1.1 类型归一字典（`TypeDictionary`）
 
@@ -36,20 +43,43 @@
 
 ### 1.2 登记的归一与合并规则（`RegistrationService`）
 
-- 实体以 `qualifiedName` 归一：不同来源对同一限定名的声明合并到同一实体；
-- 字段以字段名归一：
+- 实体以归一后的 `qualifiedName` 识别：不同来源对同一限定名的声明合并到同一实体；
+- 同名实体被声明为**不同种类**（如 TABLE vs VIEW）→ 整批以 `KIND_CONFLICT` 拒绝，
+  **绝不悄悄合成一条记录**，与字段级 `TYPE_CONFLICT`、输入级 `INVALID_PAYLOAD` 明确区分；
+- 字段以归一后的字段名识别：
   - 该来源首次声明该字段且规范类型与既有一致 → 追加来源（`MERGED`）；
   - 该来源此前已以相同规范类型声明 → `NO_CHANGE`（幂等，来源不重复计数）；
-  - 规范类型与既有定义不同 → `TYPE_CONFLICT` **拒绝，绝不覆盖既有定义**；
-- 整批字段中只要存在一条非法 / 冲突字段，**整批拒绝且不落库任何数据**；
-- 结论枚举 `Decision`：`ACCEPTED`（新建）/ `MERGED`（补充合并）/ `NO_CHANGE`（幂等无变化）/ `REJECTED`。
+  - 规范类型与既有定义不同 → 按 `TypeArbitrator` **固定类型优先级裁决**（见 1.2.1），
+    与到达顺序、并发调度无关；
+- 整批字段中只要存在一条非法 / 冲突 / 种类不符的声明，**整批拒绝且规范数据不落库**；
+  批次内每条声明（含本身合法但未落库的）都会给出逐条结论与理由；
+  落败来源仅记入字段的 `rejectedClaims` 拒绝台账（交代去向，不属于规范数据），
+  已登记数据不被污染；
+- 结论枚举 `Decision`：`ACCEPTED`（新建）/ `MERGED`（补充合并 / 裁决取代）/
+  `NO_CHANGE`（幂等无变化）/ `REJECTED`。
+
+#### 1.2.1 类型裁决规则（`TypeArbitrator`）
+
+同名字段出现多种规范类型声明时，按**固定类型优先级**裁决，全序如下：
+
+`DECIMAL > DOUBLE > BIGINT > INTEGER > TIMESTAMP > STRING > BOOLEAN`
+
+- 新声明优先级**高于**既有规范类型 → 新声明胜出：规范类型被取代，
+  既有生效来源转入该字段的拒绝台账（`MERGED`，结论中写明裁决依据）；
+- 新声明优先级**低于**既有规范类型 → 新声明以 `TYPE_CONFLICT` 拒绝并记入拒绝台账。
+
+因为裁决依据是与到达顺序无关的全序，**同一实体的同一组声明无论先来后到、多少并发，
+最终规范类型、生效来源集合与每个来源的去向（生效 / 被拒）都完全一致**——
+不是"谁先到谁说了算"。每个来源的最终去向可从字段状态直接查询：
+在 `sources` 中 = 生效合并；在 `rejectedClaims` 中 = 被 `TYPE_CONFLICT` 拒绝 / 取代。
 
 ### 1.3 并发确定性
 
 - 每个实体一把锁（`LocalMetadataStore.lockFor`），同一实体的并发登记 / 变更被串行化，
   不存在丢失更新；结论与“把这些请求按某一顺序串行执行”完全一致；
-- 同字段冲突类型并发提交时，**恰好一个声明建立规范类型**，其余声明得到 `TYPE_CONFLICT`，
-  字段来源表不被冲突类型污染（见 `RegistrationServiceTest` 的 20 轮压测）；
+- 同字段冲突类型并发提交时，按固定类型优先级裁决：无论线程如何调度，
+  收敛到同一个规范类型、同一组生效来源与拒绝台账
+  （见 `RegistrationServiceTest` 与 `NormalizationConvergenceTest` 的多轮压测）；
 - 血缘的环检测与写入在同一把血缘锁内完成；删除实体遵循“先实体锁后血缘锁”的固定加锁顺序，避免死锁。
 
 ---
@@ -78,17 +108,23 @@
 | `ADD` 不存在字段 | 兼容（纯新增向后兼容）→ 生效 |
 | `ADD` 已存在字段且类型一致 | `NO_CHANGE` |
 | `ADD` 已存在字段但类型不同 | `TYPE_CHANGE_INCOMPATIBLE`（请走 `ALTER_TYPE`） |
-| `DROP` 任意字段 | `FIELD_REMOVED_INCOMPATIBLE`（删除使既有消费方失效，始终破坏性） |
-| `ALTER_TYPE` | 仅允许**数值放宽**：`INTEGER→BIGINT/DECIMAL/DOUBLE`、`BIGINT→DECIMAL/DOUBLE`；相同类型视为无效变更；其余（收窄 / 跨族类）→ `TYPE_CHANGE_INCOMPATIBLE` |
+| `DROP` 不存在字段 | `UNKNOWN_FIELD`（与实体不存在 `UNKNOWN_ENTITY` 明确区分） |
+| `DROP` 已存在字段 | `FIELD_REMOVED_INCOMPATIBLE`（删除使既有消费方失效，始终破坏性） |
+| `ALTER_TYPE` 不存在字段 | `UNKNOWN_FIELD` |
+| `ALTER_TYPE` 已存在字段 | 仅允许**数值放宽**：`INTEGER→BIGINT/DECIMAL/DOUBLE`、`BIGINT→DECIMAL/DOUBLE`；相同类型视为无效变更；其余（收窄 / 跨族类）→ `TYPE_CHANGE_INCOMPATIBLE` |
 
 每条操作都在响应 `opResults` 中给出独立的字段名、结论、原因与文字依据。
 
-### 3.1 废弃与权限（写保护，原因可区分）
+### 3.1 废弃与权限（写保护，所有入口一致，原因可区分）
 
-- **已废弃实体**：`deprecate` 之后，对该实体的登记、字段变更、血缘写操作一律拒绝，
+- **已废弃实体**：`deprecate` 之后，对该实体的**一切写操作**——登记、字段变更、
+  血缘登记（作为上游或下游）、再次废弃、移除——一律拒绝，
   原因 `ENTITY_DEPRECATED`（即使是 admin 也拒绝）；
-- **修改权限**：对某实体首次调用授权接口后进入白名单模式，仅被授权操作者与超级操作者
-  `admin` 可写，未授权者得到 `PERMISSION_DENIED`；未授权过的实体默认开放写。
+- **只读授权状态**：对某实体首次调用授权接口后进入白名单模式，仅被授权操作者与
+  超级操作者 `admin` 可写，其余操作者对该实体只读，五个写入口统一得到
+  `PERMISSION_DENIED`；未授权过的实体默认开放写；
+- 两类拒绝原因始终可区分：`ENTITY_DEPRECATED` ≠ `PERMISSION_DENIED`，
+  且与 `UNKNOWN_ENTITY`（实体不存在）、`UNKNOWN_FIELD`（字段不存在）互不混淆。
 
 ### 3.2 审计
 
@@ -105,7 +141,9 @@
 | `MISSING_FIELD_NAME` | 登记或变更中存在未命名的字段 |
 | `UNKNOWN_TYPE` | 原始类型不在类型字典中，无法归一 |
 | `DUPLICATE_FIELD_IN_PAYLOAD` | 同一登记批次内字段重名 |
-| `TYPE_CONFLICT` | 同名字段的声明与既有规范类型冲突，拒绝覆盖 |
+| `TYPE_CONFLICT` | 同名字段的声明类型按固定优先级裁决落败，拒绝覆盖 |
+| `KIND_CONFLICT` | 同名实体被声明为不同种类（如 TABLE vs VIEW），拒绝合并 |
+| `UNKNOWN_FIELD` | 目标字段不存在（ALTER_TYPE / DROP），与 UNKNOWN_ENTITY 明确区分 |
 | `ENTITY_DEPRECATED` | 对已废弃实体执行写操作 |
 | `PERMISSION_DENIED` | 操作者不在实体写白名单内 |
 | `UNKNOWN_ENTITY` | 目标实体不存在（含血缘端点、变更目标） |
@@ -176,10 +214,18 @@ curl -s "localhost:8080/api/catalog/audit?qualifiedName=ods.user"
 mvn test
 ```
 
-共 26 个测试，全部无外部依赖：
+共 35 个测试，全部无外部依赖、全部在本地完成：
 
 - `RegistrationServiceTest`（7）：归一合并、幂等、非法 / 缺失 / 批次重复字段、
-  类型冲突、**16 线程并发相同声明**与 **12 线程 × 20 轮并发冲突类型**的确定性；
+  类型冲突、16 线程并发相同声明、**12 线程 × 20 轮并发冲突类型的收敛一致性**
+  （每轮规范类型、生效来源、拒绝台账完全相同）；
+- `NormalizationConvergenceTest`（6，新增）：书写差异（大小写 / 首尾空白）在登记 / 变更 /
+  血缘 / 废弃入口归一到同一对象；裁决取代可解释；**10 轮乱序提交**与
+  **8 线程 × 20 轮并发混合声明**最终状态与调度无关；种类不一致 `KIND_CONFLICT`；
+  混合批次整体不落库且既有数据不被污染；
+- `WriteProtectionConsistencyTest`（3，新增）：已废弃实体五个写入口统一
+  `ENTITY_DEPRECATED`；只读（白名单外）操作者五个写入口统一 `PERMISSION_DENIED`；
+  `UNKNOWN_ENTITY` 与 `UNKNOWN_FIELD` / `UNKNOWN_TYPE` / `PERMISSION_DENIED` 明确区分；
 - `LineageServiceTest`（7）：自引用、成环（附路径）、重复与并发重复不计数、
   并发关闭环缺口、多跳影响分层、删除后无悬空血缘、未知端点；
 - `CompatibilityServiceTest`（10）：新增 / 删除 / 放宽 / 收窄 / 跨族类变更、
@@ -188,4 +234,14 @@ mvn test
 - `ApplicationTests`（1）：Spring 上下文加载。
 
 测试与服务日志使用 `[REGISTER] / [LINEAGE] / [IMPACT] / [CHANGE] / [DEPRECATE] / [REMOVE]`
-前缀，**打印每次输入与判定依据（含逐字段 / 逐操作结论、成环路径）**，便于人工核对。
+前缀，**打印每次输入与判定依据（含逐字段 / 逐操作结论、裁决优先级、成环路径）**，
+便于人工核对。
+
+### 6.1 兼容范围
+
+- 归一仅覆盖**对象名书写差异**（大小写、首尾空白）与**类型字典内别名**
+  （如 `varchar`/`text` → `STRING`）；不做语义级匹配（如同义词、命名风格转换）；
+- 种类（TABLE / VIEW / STREAM）不参与归一合并：同名不同种类一律 `KIND_CONFLICT` 拒绝；
+- 类型裁决只在**同一字段的多种规范类型声明**之间进行；`ALTER_TYPE` 变更仍按
+  第 3 节的放宽白名单判定，两套规则互不影响；
+- 全部状态保存在进程内存中，重启即清空；不依赖任何外部服务。

@@ -11,7 +11,9 @@ import org.springframework.stereotype.Service;
 
 /**
  * 实体废弃与移除服务。
- * 写操作同样经过权限校验；废弃后实体的所有登记 / 变更 / 血缘写操作均被拒绝。
+ * 实体名按 {@link NameNormalizer} 统一归一（大小写 / 首尾空白差异视为同一对象）。
+ * 写保护与其他入口一致：实体已废弃时，废弃与移除同样被拒绝（ENTITY_DEPRECATED）；
+ * 无权限操作者被拒绝（PERMISSION_DENIED）；目标不存在为 UNKNOWN_ENTITY，三类原因明确区分。
  * 移除时级联清理全部关联血缘边并审计清理条数，保证无悬空血缘。
  */
 @Service
@@ -27,13 +29,16 @@ public class EntityAdminService {
         this.permissionService = permissionService;
     }
 
-    /** 标记废弃。返回 NONE 表示成功（NO_CHANGE 表示此前已废弃），否则为拒绝原因。 */
+    /** 标记废弃。返回 NONE 表示成功；已废弃 / 无权限 / 实体不存在分别返回可区分原因。 */
     public RejectReason deprecate(String operator, String qualifiedName) {
         log.info("[DEPRECATE] 输入 operator={}, qualifiedName={}", operator, qualifiedName);
         if (isBlank(operator) || isBlank(qualifiedName)) {
             return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
                     RejectReason.INVALID_PAYLOAD, "operator 与 qualifiedName 均为必填项");
         }
+        // 归一：仅大小写 / 首尾空白差异的实体名视为同一对象
+        qualifiedName = NameNormalizer.normalize(qualifiedName);
+        operator = operator.trim();
         var lock = store.lockFor(qualifiedName);
         lock.lock();
         try {
@@ -42,16 +47,15 @@ public class EntityAdminService {
                 return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
                         RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qualifiedName);
             }
+            if (entity.isDeprecated()) {
+                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
+                        RejectReason.ENTITY_DEPRECATED,
+                        "实体 " + qualifiedName + " 已废弃，拒绝一切写操作（含重复废弃）");
+            }
             if (!permissionService.canWrite(qualifiedName, operator)) {
                 return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
                         RejectReason.PERMISSION_DENIED,
                         "操作者 '" + operator + "' 对实体 " + qualifiedName + " 无修改权限");
-            }
-            if (entity.isDeprecated()) {
-                store.appendAudit(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
-                        Decision.NO_CHANGE, RejectReason.NONE, "实体此前已废弃，幂等返回");
-                log.info("[DEPRECATE] qualifiedName={} decision=NO_CHANGE", qualifiedName);
-                return RejectReason.NONE;
             }
             entity.markDeprecated();
             store.appendAudit(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
@@ -70,6 +74,9 @@ public class EntityAdminService {
             return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
                     RejectReason.INVALID_PAYLOAD, "operator 与 qualifiedName 均为必填项");
         }
+        // 归一：仅大小写 / 首尾空白差异的实体名视为同一对象
+        qualifiedName = NameNormalizer.normalize(qualifiedName);
+        operator = operator.trim();
         var entityLock = store.lockFor(qualifiedName);
         // 固定加锁顺序：先实体锁后血缘锁，避免与血缘登记路径互相等待
         entityLock.lock();
@@ -79,6 +86,11 @@ public class EntityAdminService {
             if (entity == null) {
                 return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
                         RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qualifiedName);
+            }
+            if (entity.isDeprecated()) {
+                return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
+                        RejectReason.ENTITY_DEPRECATED,
+                        "实体 " + qualifiedName + " 已废弃，拒绝一切写操作（含移除）");
             }
             if (!permissionService.canWrite(qualifiedName, operator)) {
                 return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,

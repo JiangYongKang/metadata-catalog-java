@@ -104,6 +104,7 @@ public class CatalogController {
     public List<AuditRecord> audit(@RequestParam(required = false) String qualifiedName) {
         return qualifiedName == null || qualifiedName.isBlank()
                 ? store.allAudit()
-                : store.auditTrail(qualifiedName);
+                : store.auditTrail(com.github.highcumontoa.metadatacatalogjava.service.NameNormalizer
+                        .normalize(qualifiedName));
     }
 }

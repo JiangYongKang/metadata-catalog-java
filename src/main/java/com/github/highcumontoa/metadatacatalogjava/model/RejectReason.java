@@ -9,8 +9,12 @@ public enum RejectReason {
     MISSING_FIELD_NAME,
     /** 来源原始类型不在类型字典中，无法归一 */
     UNKNOWN_TYPE,
-    /** 同名字段与既有规范类型冲突 */
+    /** 同名字段与既有规范类型冲突（按 TypeArbitrator 固定优先级裁决后落败） */
     TYPE_CONFLICT,
+    /** 同名实体被不同来源声明为不同种类（如 TABLE vs VIEW），拒绝合并 */
+    KIND_CONFLICT,
+    /** 目标字段不存在（与实体不存在 UNKNOWN_ENTITY 明确区分） */
+    UNKNOWN_FIELD,
     /** 实体已废弃，拒绝一切写操作 */
     ENTITY_DEPRECATED,
     /** 操作者对该实体无修改权限 */

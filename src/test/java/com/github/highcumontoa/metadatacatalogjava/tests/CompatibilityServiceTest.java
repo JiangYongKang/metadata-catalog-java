@@ -13,6 +13,7 @@ import com.github.highcumontoa.metadatacatalogjava.service.CompatibilityService;
 import com.github.highcumontoa.metadatacatalogjava.service.EntityAdminService;
 import com.github.highcumontoa.metadatacatalogjava.service.PermissionService;
 import com.github.highcumontoa.metadatacatalogjava.service.RegistrationService;
+import com.github.highcumontoa.metadatacatalogjava.service.TypeArbitrator;
 import com.github.highcumontoa.metadatacatalogjava.service.TypeDictionary;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
 import org.junit.jupiter.api.BeforeEach;
@@ -46,7 +47,7 @@ class CompatibilityServiceTest {
         store = new LocalMetadataStore();
         var types = new TypeDictionary();
         permissions = new PermissionService();
-        registration = new RegistrationService(store, types, permissions);
+        registration = new RegistrationService(store, types, permissions, new TypeArbitrator());
         compatibility = new CompatibilityService(store, types, permissions);
         admin = new EntityAdminService(store, permissions);
         registration.register(new RegistrationRequest("hive", "db.t", "TABLE", List.of(

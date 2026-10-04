@@ -11,6 +11,7 @@ import com.github.highcumontoa.metadatacatalogjava.service.EntityAdminService;
 import com.github.highcumontoa.metadatacatalogjava.service.LineageService;
 import com.github.highcumontoa.metadatacatalogjava.service.PermissionService;
 import com.github.highcumontoa.metadatacatalogjava.service.RegistrationService;
+import com.github.highcumontoa.metadatacatalogjava.service.TypeArbitrator;
 import com.github.highcumontoa.metadatacatalogjava.service.TypeDictionary;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,7 +49,7 @@ class LineageServiceTest {
         store = new LocalMetadataStore();
         var types = new TypeDictionary();
         var perms = new PermissionService();
-        var registration = new RegistrationService(store, types, perms);
+        var registration = new RegistrationService(store, types, perms, new TypeArbitrator());
         lineage = new LineageService(store, perms);
         admin = new EntityAdminService(store, perms);
         for (String name : List.of("a", "b", "c", "d")) {

@@ -35,7 +35,9 @@ import java.util.Set;
  *       其余（含收窄、跨族类、相同类型）均 TYPE_CHANGE_INCOMPATIBLE；</li>
  * </ul>
  * 所有操作先在快照上完整判定，全部通过才在实体锁内落库，保证原子性与并发确定性。
- * 已废弃实体 / 无权限操作者分别以 ENTITY_DEPRECATED / PERMISSION_DENIED 拒绝。
+ * 实体名与字段名按 {@link NameNormalizer} 统一归一（大小写 / 首尾空白差异视为同一对象）。
+ * 已废弃实体 / 无权限操作者分别以 ENTITY_DEPRECATED / PERMISSION_DENIED 拒绝；
+ * 目标实体不存在为 UNKNOWN_ENTITY，目标字段不存在为 UNKNOWN_FIELD，两者明确区分。
  */
 @Service
 public class CompatibilityService {
@@ -71,7 +73,8 @@ public class CompatibilityService {
                     null, RejectReason.INVALID_PAYLOAD,
                     "qualifiedName 与 operator 均为必填项", List.of());
         }
-        String qn = request.qualifiedName().trim();
+        // 归一：仅大小写 / 首尾空白差异的实体名视为同一对象
+        String qn = NameNormalizer.normalize(request.qualifiedName());
         String operator = request.operator().trim();
         if (request.ops() == null || request.ops().isEmpty()) {
             return reject(qn, operator, RejectReason.INVALID_PAYLOAD,
@@ -105,7 +108,8 @@ public class CompatibilityService {
 
             for (ChangeFieldOp op : request.ops()) {
                 String opName = op.op() == null ? "" : op.op().trim().toUpperCase();
-                String fieldName = op.fieldName() == null ? null : op.fieldName().trim();
+                // 归一：仅大小写 / 首尾空白差异的字段名视为同一字段
+                String fieldName = NameNormalizer.normalize(op.fieldName());
                 if (fieldName == null || fieldName.isEmpty()) {
                     results.add(new FieldResult(null, Decision.REJECTED, RejectReason.MISSING_FIELD_NAME,
                             "变更操作缺少字段名：" + opName));
@@ -141,9 +145,19 @@ public class CompatibilityService {
                                             + "，ADD 不允许隐式改类型，请使用 ALTER_TYPE"));
                         }
                     }
-                    case "DROP" -> results.add(new FieldResult(fieldName, Decision.REJECTED,
-                            RejectReason.FIELD_REMOVED_INCOMPATIBLE,
-                            "删除字段 " + fieldName + " 会使既有消费方失效，按兼容策略判定为破坏性变更"));
+                    case "DROP" -> {
+                        if (!working.containsKey(fieldName)) {
+                            results.add(new FieldResult(fieldName, Decision.REJECTED,
+                                    RejectReason.UNKNOWN_FIELD,
+                                    "字段不存在，无法 DROP：" + fieldName
+                                            + "（与实体不存在 UNKNOWN_ENTITY 明确区分）"));
+                        } else {
+                            results.add(new FieldResult(fieldName, Decision.REJECTED,
+                                    RejectReason.FIELD_REMOVED_INCOMPATIBLE,
+                                    "删除字段 " + fieldName
+                                            + " 会使既有消费方失效，按兼容策略判定为破坏性变更"));
+                        }
+                    }
                     case "ALTER_TYPE" -> {
                         Optional<DataType> target = typeDictionary.normalize(op.rawType());
                         if (target.isEmpty()) {
@@ -153,8 +167,9 @@ public class CompatibilityService {
                         }
                         FieldDef exists = working.get(fieldName);
                         if (exists == null) {
-                            results.add(new FieldResult(fieldName, Decision.REJECTED, RejectReason.UNKNOWN_ENTITY,
-                                    "字段不存在，无法 ALTER_TYPE：" + fieldName));
+                            results.add(new FieldResult(fieldName, Decision.REJECTED, RejectReason.UNKNOWN_FIELD,
+                                    "字段不存在，无法 ALTER_TYPE：" + fieldName
+                                            + "（与实体不存在 UNKNOWN_ENTITY 明确区分）"));
                             break;
                         }
                         DataType from = exists.getCanonicalType();

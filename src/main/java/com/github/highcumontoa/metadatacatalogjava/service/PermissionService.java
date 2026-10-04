@@ -17,17 +17,18 @@ public class PermissionService {
 
     private final ConcurrentHashMap<String, Set<String>> grants = new ConcurrentHashMap<>();
 
-    /** 为操作者授予某实体的写权限；首次授权后实体即进入白名单模式。 */
+    /** 为操作者授予某实体的写权限；首次授权后实体即进入白名单（其余操作者只读）模式。 */
     public void grant(String qualifiedName, String operator) {
-        grants.computeIfAbsent(qualifiedName, k -> ConcurrentHashMap.newKeySet()).add(operator);
+        grants.computeIfAbsent(NameNormalizer.normalize(qualifiedName),
+                k -> ConcurrentHashMap.newKeySet()).add(operator);
     }
 
-    /** 判断操作者能否写某实体；admin 始终放行。 */
+    /** 判断操作者能否写某实体；admin 始终放行。实体名按统一规则归一后匹配授权。 */
     public boolean canWrite(String qualifiedName, String operator) {
         if (ADMIN.equals(operator)) {
             return true;
         }
-        Set<String> allowed = grants.get(qualifiedName);
+        Set<String> allowed = grants.get(NameNormalizer.normalize(qualifiedName));
         // 未显式授权的实体默认开放写；进入白名单模式后严格校验。
         return allowed == null || allowed.contains(operator);
     }

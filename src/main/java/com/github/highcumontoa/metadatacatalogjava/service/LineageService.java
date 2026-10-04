@@ -26,7 +26,8 @@ import java.util.Set;
  *
  * <p>规则：</p>
  * <ol>
- *   <li>上下游实体必须均已登记，否则 UNKNOWN_ENTITY；</li>
+ *   <li>上下游实体必须均已登记，否则 UNKNOWN_ENTITY（实体名按 NameNormalizer 统一归一）；</li>
+ *   <li>任一端点已废弃 -> ENTITY_DEPRECATED，与权限拒绝 PERMISSION_DENIED 明确区分；</li>
  *   <li>自引用（upstream == downstream）以 SELF_REFERENCE 拒绝；</li>
  *   <li>若 downstream 已能沿既有血缘到达 upstream，则新增 upstream->downstream 成环，
  *       以 CYCLE_DETECTED 拒绝，并给出可达路径作为依据；</li>
@@ -59,8 +60,9 @@ public class LineageService {
                     "upstream 与 downstream 均为必填项");
         }
         String source = isBlank(request.source()) ? "anonymous" : request.source().trim();
-        String upstream = request.upstream().trim();
-        String downstream = request.downstream().trim();
+        // 归一：仅大小写 / 首尾空白差异的实体名视为同一对象，不会各算一套血缘
+        String upstream = NameNormalizer.normalize(request.upstream());
+        String downstream = NameNormalizer.normalize(request.downstream());
 
         store.lineageLock().lock();
         try {
@@ -71,6 +73,11 @@ public class LineageService {
             if (upstream.equals(downstream)) {
                 return reject(request, RejectReason.SELF_REFERENCE,
                         "拒绝自引用血缘：" + upstream + " -> " + downstream);
+            }
+            if (store.getEntity(upstream).isDeprecated() || store.getEntity(downstream).isDeprecated()) {
+                return reject(request, RejectReason.ENTITY_DEPRECATED,
+                        "血缘端点存在已废弃实体（upstream=" + upstream + ", downstream=" + downstream
+                                + "），拒绝血缘登记");
             }
             if (!permissionService.canWrite(downstream, source)
                     || !permissionService.canWrite(upstream, source)) {
@@ -115,6 +122,7 @@ public class LineageService {
     /** 下游多跳影响：BFS 按跳数分层；若遍历中遇到已访问层级之外的回边，则标记 cycleMarked。 */
     public ImpactResult downstreamImpact(String qualifiedName) {
         log.info("[IMPACT] 输入 origin={}", qualifiedName);
+        qualifiedName = NameNormalizer.normalize(qualifiedName);
         if (isBlank(qualifiedName) || store.getEntity(qualifiedName) == null) {
             throw new IllegalArgumentException("实体不存在或名称为空：" + qualifiedName);
         }
@@ -184,8 +192,8 @@ public class LineageService {
     }
 
     private LineageResult reject(LineageRequest request, RejectReason reason, String message) {
-        String up = request == null ? null : request.upstream();
-        String down = request == null ? null : request.downstream();
+        String up = request == null ? null : NameNormalizer.normalize(request.upstream());
+        String down = request == null ? null : NameNormalizer.normalize(request.downstream());
         String source = request == null || isBlank(request.source()) ? "anonymous" : request.source().trim();
         LineageResult result = new LineageResult(up, down, Decision.REJECTED, reason, message);
         store.appendAudit(ActionType.REGISTER_LINEAGE, source,

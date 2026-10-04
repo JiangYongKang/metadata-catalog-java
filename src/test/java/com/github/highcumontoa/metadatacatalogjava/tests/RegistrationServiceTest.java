@@ -11,6 +11,7 @@ import com.github.highcumontoa.metadatacatalogjava.model.FieldDef;
 import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
 import com.github.highcumontoa.metadatacatalogjava.service.PermissionService;
 import com.github.highcumontoa.metadatacatalogjava.service.RegistrationService;
+import com.github.highcumontoa.metadatacatalogjava.service.TypeArbitrator;
 import com.github.highcumontoa.metadatacatalogjava.service.TypeDictionary;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
 import org.junit.jupiter.api.BeforeEach;
@@ -44,7 +45,7 @@ class RegistrationServiceTest {
     @BeforeEach
     void setUp() {
         store = new LocalMetadataStore();
-        registration = new RegistrationService(store, new TypeDictionary(), new PermissionService());
+        registration = new RegistrationService(store, new TypeDictionary(), new PermissionService(), new TypeArbitrator());
     }
 
     @Test
@@ -172,13 +173,13 @@ class RegistrationServiceTest {
     }
 
     @Test
-    @DisplayName("并发登记：同字段冲突类型，恰好一个规范类型，其余 N-1 个 TYPE_CONFLICT，结论稳定")
-    void concurrentConflictingRegistrationsSingleCanonical() throws InterruptedException {
+    @DisplayName("并发登记：同字段冲突类型按固定优先级裁决，多轮并发下最终状态与每个来源去向完全一致")
+    void concurrentConflictingRegistrationsConvergeDeterministically() throws InterruptedException {
         int threads = 12;
         for (int round = 0; round < 20; round++) {
             LocalMetadataStore roundStore = new LocalMetadataStore();
             RegistrationService roundReg = new RegistrationService(roundStore, new TypeDictionary(),
-                    new PermissionService());
+                    new PermissionService(), new TypeArbitrator());
             ExecutorService pool = Executors.newFixedThreadPool(threads);
             CountDownLatch start = new CountDownLatch(1);
             AtomicInteger accepted = new AtomicInteger();
@@ -193,7 +194,6 @@ class RegistrationServiceTest {
                         RegistrationResult r = roundReg.register(new RegistrationRequest(
                                 source, "db.conflict", "TABLE",
                                 List.of(new FieldClaim("id", type))));
-                        // 与规范类型一致的其它来源 MERGED；不一致的 TYPE_CONFLICT
                         if (r.decision() == Decision.ACCEPTED) {
                             accepted.incrementAndGet();
                         } else if (r.decision() == Decision.MERGED) {
@@ -210,17 +210,30 @@ class RegistrationServiceTest {
             pool.shutdown();
             assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
             FieldDef id = roundStore.getEntity("db.conflict").getFields().get("id");
-            assertNotNull(id.getCanonicalType());
-            assertEquals(1, accepted.get(), "第" + round + "轮：恰好一个来源的声明建立规范");
-            // 两种类型各 6 个来源：胜方类型其余 5 个 MERGED，败方类型全部 6 个 TYPE_CONFLICT
-            assertEquals(5, merged.get(), "第" + round + "轮：与规范一致的其余来源合并");
-            assertEquals(6, conflict.get(), "第" + round + "轮：与规范冲突的来源全部可区分拒绝");
-            // 不变量：字段只保留一个规范类型；6 个同类型来源合并到该字段，
-            // 6 个冲突来源被拒绝且不污染字段来源表（不静默覆盖）
-            assertEquals(6, id.getSources().size(), "第" + round + "轮：仅同规范类型的来源记录在字段上");
+            // 裁决依据固定优先级 BIGINT > STRING，与线程调度无关：
+            // 每一轮的规范类型、生效来源集合、拒绝台账都必须完全相同
+            assertEquals(DataType.BIGINT, id.getCanonicalType(),
+                    "第" + round + "轮：规范类型必须收敛到固定优先级更高的 BIGINT，与调度无关");
+            assertEquals(6, id.getSources().size(), "第" + round + "轮：6 个 bigint 来源全部生效合并");
+            assertEquals(6, id.getRejectedClaims().size(), "第" + round + "轮：6 个 string 来源全部在拒绝台账");
+            for (int i = 0; i < threads; i++) {
+                String source = "src-" + i;
+                if (i % 2 == 0) {
+                    assertTrue(id.getSources().containsKey(source),
+                            "第" + round + "轮：bigint 来源 " + source + " 的去向必须是生效合并");
+                } else {
+                    assertEquals("string", id.getRejectedClaims().get(source),
+                            "第" + round + "轮：string 来源 " + source + " 的去向必须是被拒绝");
+                }
+            }
+            assertEquals(1, accepted.get(), "第" + round + "轮：恰好一个线程创建实体");
+            assertEquals(threads, accepted.get() + merged.get() + conflict.get(),
+                    "第" + round + "轮：每个请求都有明确结论");
             if (round == 0) {
-                log.info("用例并发冲突 线程数={} ACCEPTED={} MERGED={} TYPE_CONFLICT={} 规范类型={}（先提交者建立规范，结论按原因可区分）",
-                        threads, accepted.get(), merged.get(), conflict.get(), id.getCanonicalType());
+                log.info("用例并发冲突 线程数={} ACCEPTED={} MERGED={} TYPE_CONFLICT={} 规范类型={} "
+                                + "生效来源={} 拒绝台账={}（按固定优先级裁决，20 轮最终状态完全一致）",
+                        threads, accepted.get(), merged.get(), conflict.get(), id.getCanonicalType(),
+                        id.getSources().keySet(), id.getRejectedClaims().keySet());
             }
         }
     }
