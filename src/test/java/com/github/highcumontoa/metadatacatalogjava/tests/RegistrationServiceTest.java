@@ -89,7 +89,7 @@ class RegistrationServiceTest {
                 new FieldClaim("a", "weirdtype"),
                 new FieldClaim(null, "bigint"),
                 new FieldClaim("b", "bigint"),
-                new FieldClaim("b", "string")));
+                new FieldClaim("b", "BIGINT ")));
         var result = registration.register(req);
         log.info("用例输入4类问题字段 -> decision={}, 逐字段结论={}", result.decision(), result.fieldResults());
         assertEquals(Decision.REJECTED, result.decision());
@@ -172,9 +172,14 @@ class RegistrationServiceTest {
     }
 
     @Test
-    @DisplayName("并发登记：同字段冲突类型，恰好一个规范类型，其余 N-1 个 TYPE_CONFLICT，结论稳定")
+    @DisplayName("并发登记：同字段冲突类型，按内容裁决收敛——规范类型与每个来源去向与调度无关，结论稳定")
     void concurrentConflictingRegistrationsSingleCanonical() throws InterruptedException {
         int threads = 12;
+        java.util.Set<String> expectedWinners = new java.util.TreeSet<>();
+        java.util.Set<String> expectedLosers = new java.util.TreeSet<>();
+        for (int i = 0; i < threads; i++) {
+            (i % 2 == 0 ? expectedWinners : expectedLosers).add("src-" + i);
+        }
         for (int round = 0; round < 20; round++) {
             LocalMetadataStore roundStore = new LocalMetadataStore();
             RegistrationService roundReg = new RegistrationService(roundStore, new TypeDictionary(),
@@ -193,7 +198,8 @@ class RegistrationServiceTest {
                         RegistrationResult r = roundReg.register(new RegistrationRequest(
                                 source, "db.conflict", "TABLE",
                                 List.of(new FieldClaim("id", type))));
-                        // 与规范类型一致的其它来源 MERGED；不一致的 TYPE_CONFLICT
+                        // 立即响应的 ACCEPTED/MERGED/REJECTED 序列可随线程调度变化，
+                        // 仅做计数留痕；最终去向以下面的收敛断言为准。
                         if (r.decision() == Decision.ACCEPTED) {
                             accepted.incrementAndGet();
                         } else if (r.decision() == Decision.MERGED) {
@@ -211,16 +217,22 @@ class RegistrationServiceTest {
             assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
             FieldDef id = roundStore.getEntity("db.conflict").getFields().get("id");
             assertNotNull(id.getCanonicalType());
-            assertEquals(1, accepted.get(), "第" + round + "轮：恰好一个来源的声明建立规范");
-            // 两种类型各 6 个来源：胜方类型其余 5 个 MERGED，败方类型全部 6 个 TYPE_CONFLICT
-            assertEquals(5, merged.get(), "第" + round + "轮：与规范一致的其余来源合并");
-            assertEquals(6, conflict.get(), "第" + round + "轮：与规范冲突的来源全部可区分拒绝");
-            // 不变量：字段只保留一个规范类型；6 个同类型来源合并到该字段，
-            // 6 个冲突来源被拒绝且不污染字段来源表（不静默覆盖）
-            assertEquals(6, id.getSources().size(), "第" + round + "轮：仅同规范类型的来源记录在字段上");
+            assertEquals(1, accepted.get(), "第" + round + "轮：恰好一个请求创建实体");
+            // 内容裁决（规范类型枚举名字典序最小，BIGINT<STRING）：无论线程调度如何，
+            // 规范类型恒为 BIGINT，每个来源的最终去向完全一致——与“谁先到”无关。
+            assertEquals(DataType.BIGINT, id.getCanonicalType(),
+                    "第" + round + "轮：胜出规范类型必须与调度无关，恒为 BIGINT");
+            assertEquals(expectedWinners, new java.util.TreeSet<>(id.getSources().keySet()),
+                    "第" + round + "轮：6 个 bigint 来源恒为胜出去向");
+            assertEquals(expectedLosers, new java.util.TreeSet<>(id.getLosingClaims().keySet()),
+                    "第" + round + "轮：6 个 string 来源恒为落败去向，不污染规范定义");
+            assertEquals(expectedWinners, new java.util.TreeSet<>(roundStore.getEntity("db.conflict").getSources()),
+                    "第" + round + "轮：实体级来源集合同样按最终裁决收敛");
             if (round == 0) {
-                log.info("用例并发冲突 线程数={} ACCEPTED={} MERGED={} TYPE_CONFLICT={} 规范类型={}（先提交者建立规范，结论按原因可区分）",
-                        threads, accepted.get(), merged.get(), conflict.get(), id.getCanonicalType());
+                log.info("用例并发冲突(内容裁决) 线程数={} 立即响应计数 ACCEPTED={} MERGED={} TYPE_CONFLICT={}（随调度变化）"
+                                + " 最终规范类型={} 胜出去向={} 落败去向={}（20轮恒定）",
+                        threads, accepted.get(), merged.get(), conflict.get(), id.getCanonicalType(),
+                        id.getSources().keySet(), id.getLosingClaims().keySet());
             }
         }
     }

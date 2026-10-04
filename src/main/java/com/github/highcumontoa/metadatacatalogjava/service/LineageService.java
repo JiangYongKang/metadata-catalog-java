@@ -5,9 +5,11 @@ import com.github.highcumontoa.metadatacatalogjava.dto.LineageRequest;
 import com.github.highcumontoa.metadatacatalogjava.dto.LineageResult;
 import com.github.highcumontoa.metadatacatalogjava.model.ActionType;
 import com.github.highcumontoa.metadatacatalogjava.model.Decision;
+import com.github.highcumontoa.metadatacatalogjava.model.EntityDef;
 import com.github.highcumontoa.metadatacatalogjava.model.LineageEdge;
 import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
+import com.github.highcumontoa.metadatacatalogjava.util.Names;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -20,19 +22,26 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.locks.Lock;
 
 /**
  * 血缘登记、环检测与多跳影响查询服务。
+ *
+ * <p>写入口一致性：端点实体名一律经 {@link Names#canonical(String)} 归一，
+ * 大小写/首尾空白差异不会各算一套血缘；端点存在性、废弃、权限检查与登记/变更/废弃/移除
+ * 各入口使用同一套顺序（存在 -&gt; 自引用 -&gt; 废弃 -&gt; 权限 -&gt; 业务规则）。</p>
  *
  * <p>规则：</p>
  * <ol>
  *   <li>上下游实体必须均已登记，否则 UNKNOWN_ENTITY；</li>
  *   <li>自引用（upstream == downstream）以 SELF_REFERENCE 拒绝；</li>
- *   <li>若 downstream 已能沿既有血缘到达 upstream，则新增 upstream->downstream 成环，
+ *   <li>任一端点实体已废弃 -> ENTITY_DEPRECATED；操作者对任一端点无写权限 -> PERMISSION_DENIED；</li>
+ *   <li>若 downstream 已能沿既有血缘到达 upstream，则新增 upstream-&gt;downstream 成环，
  *       以 CYCLE_DETECTED 拒绝，并给出可达路径作为依据；</li>
  *   <li>相同的边重复登记结论为 NO_CHANGE，不重复计数；</li>
- *   <li>环检测与写入在全局 lineageLock 下完成，保证并发下结论确定；</li>
- *   <li>下游影响按跳数分层返回；图中既有的异常环通过 cycleMarked 显式标记。</li>
+ *   <li>加锁顺序全局固定：按规范名升序获取两端实体锁，再获取血缘锁，
+ *       环检测与写入在同一临界区完成，与实体移除路径不会互相等待、结论确定。</li>
  * </ol>
  */
 @Service
@@ -59,23 +68,42 @@ public class LineageService {
                     "upstream 与 downstream 均为必填项");
         }
         String source = isBlank(request.source()) ? "anonymous" : request.source().trim();
-        String upstream = request.upstream().trim();
-        String downstream = request.downstream().trim();
+        String upstream = Names.canonical(request.upstream());
+        String downstream = Names.canonical(request.downstream());
 
+        // 固定加锁顺序：端点实体锁（规范名升序）-> 血缘锁，避免与移除路径死锁；
+        // 自引用时两端点同名，只取一把锁
+        Set<String> endpoints = new TreeSet<>();
+        endpoints.add(upstream);
+        endpoints.add(downstream);
+        List<Lock> entityLocks = endpoints.stream().map(store::lockFor).toList();
+        entityLocks.forEach(Lock::lock);
         store.lineageLock().lock();
         try {
-            if (store.getEntity(upstream) == null || store.getEntity(downstream) == null) {
+            EntityDef upEntity = store.getEntity(upstream);
+            EntityDef downEntity = store.getEntity(downstream);
+            if (upEntity == null || downEntity == null) {
                 return reject(request, RejectReason.UNKNOWN_ENTITY,
-                        "上下游实体必须均已登记：upstream=" + upstream + ", downstream=" + downstream);
+                        "上下游实体必须均已登记：upstream=" + upstream + ", downstream=" + downstream,
+                        upstream, downstream, source);
             }
             if (upstream.equals(downstream)) {
                 return reject(request, RejectReason.SELF_REFERENCE,
-                        "拒绝自引用血缘：" + upstream + " -> " + downstream);
+                        "拒绝自引用血缘：" + upstream + " -> " + downstream,
+                        upstream, downstream, source);
+            }
+            if (upEntity.isDeprecated() || downEntity.isDeprecated()) {
+                return reject(request, RejectReason.ENTITY_DEPRECATED,
+                        "血缘端点存在已废弃实体（upstream=" + upstream + " deprecated=" + upEntity.isDeprecated()
+                                + ", downstream=" + downstream + " deprecated=" + downEntity.isDeprecated()
+                                + "），拒绝一切写操作",
+                        upstream, downstream, source);
             }
             if (!permissionService.canWrite(downstream, source)
                     || !permissionService.canWrite(upstream, source)) {
                 return reject(request, RejectReason.PERMISSION_DENIED,
-                        "来源/操作者 '" + source + "' 对血缘涉及实体无写权限");
+                        "来源/操作者 '" + source + "' 对血缘涉及实体无写权限",
+                        upstream, downstream, source);
             }
             if (store.lineageExists(upstream, downstream)) {
                 LineageResult result = new LineageResult(upstream, downstream, Decision.NO_CHANGE,
@@ -109,23 +137,25 @@ public class LineageService {
             return result;
         } finally {
             store.lineageLock().unlock();
+            entityLocks.forEach(Lock::unlock);
         }
     }
 
     /** 下游多跳影响：BFS 按跳数分层；若遍历中遇到已访问层级之外的回边，则标记 cycleMarked。 */
     public ImpactResult downstreamImpact(String qualifiedName) {
-        log.info("[IMPACT] 输入 origin={}", qualifiedName);
-        if (isBlank(qualifiedName) || store.getEntity(qualifiedName) == null) {
+        String origin = Names.canonical(qualifiedName);
+        log.info("[IMPACT] 输入 origin={}", origin);
+        if (origin == null || store.getEntity(origin) == null) {
             throw new IllegalArgumentException("实体不存在或名称为空：" + qualifiedName);
         }
         Map<Integer, List<String>> hopsMap = new LinkedHashMap<>();
         Set<String> visited = new LinkedHashSet<>();
-        visited.add(qualifiedName);
+        visited.add(origin);
         boolean[] cycle = {false};
 
         Deque<String> queue = new ArrayDeque<>();
         Deque<Integer> distQueue = new ArrayDeque<>();
-        queue.add(qualifiedName);
+        queue.add(origin);
         distQueue.add(0);
 
         while (!queue.isEmpty()) {
@@ -148,8 +178,8 @@ public class LineageService {
         List<ImpactResult.Hop> hops = new ArrayList<>();
         hopsMap.forEach((distance, entities) -> hops.add(new ImpactResult.Hop(distance,
                         entities.stream().sorted().toList())));
-        log.info("[IMPACT] origin={} 结论 hops={}, cycleMarked={}", qualifiedName, hops, cycle[0]);
-        return new ImpactResult(qualifiedName, List.copyOf(hops), cycle[0]);
+        log.info("[IMPACT] origin={} 结论 hops={}, cycleMarked={}", origin, hops, cycle[0]);
+        return new ImpactResult(origin, List.copyOf(hops), cycle[0]);
     }
 
     /** 从 from 到 to 的一条可达路径（BFS），不可达返回 null；在 lineageLock 下调用。 */
@@ -184,9 +214,14 @@ public class LineageService {
     }
 
     private LineageResult reject(LineageRequest request, RejectReason reason, String message) {
-        String up = request == null ? null : request.upstream();
-        String down = request == null ? null : request.downstream();
+        String up = Names.canonical(request == null ? null : request.upstream());
+        String down = Names.canonical(request == null ? null : request.downstream());
         String source = request == null || isBlank(request.source()) ? "anonymous" : request.source().trim();
+        return reject(request, reason, message, up, down, source);
+    }
+
+    private LineageResult reject(LineageRequest request, RejectReason reason, String message,
+                                 String up, String down, String source) {
         LineageResult result = new LineageResult(up, down, Decision.REJECTED, reason, message);
         store.appendAudit(ActionType.REGISTER_LINEAGE, source,
                 up + "->" + down, Decision.REJECTED, reason, message);

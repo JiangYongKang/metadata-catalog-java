@@ -11,6 +11,12 @@ public enum RejectReason {
     UNKNOWN_TYPE,
     /** 同名字段与既有规范类型冲突 */
     TYPE_CONFLICT,
+    /** 同一实体名被不同来源声明为不同种类（如 TABLE vs VIEW），拒绝静默合并 */
+    KIND_CONFLICT,
+    /** 同一批次内同名字段声明了不同类型（彼此互斥），区别于整字段重名 */
+    FIELD_CONFLICT_IN_PAYLOAD,
+    /** 实体存在但被操作的字段不存在（与 UNKNOWN_ENTITY 明确区分） */
+    UNKNOWN_FIELD,
     /** 实体已废弃，拒绝一切写操作 */
     ENTITY_DEPRECATED,
     /** 操作者对该实体无修改权限 */

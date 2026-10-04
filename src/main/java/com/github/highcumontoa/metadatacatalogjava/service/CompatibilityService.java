@@ -11,6 +11,7 @@ import com.github.highcumontoa.metadatacatalogjava.model.EntityDef;
 import com.github.highcumontoa.metadatacatalogjava.model.FieldDef;
 import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
+import com.github.highcumontoa.metadatacatalogjava.util.Names;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -67,11 +68,11 @@ public class CompatibilityService {
                         : request.ops().stream().map(o -> o.op() + ":" + o.fieldName() + ":" + o.rawType()).toList());
 
         if (request == null || isBlank(request.qualifiedName()) || isBlank(request.operator())) {
-            return reject(request == null ? null : request.qualifiedName(),
+            return reject(request == null ? null : Names.canonical(request.qualifiedName()),
                     null, RejectReason.INVALID_PAYLOAD,
                     "qualifiedName 与 operator 均为必填项", List.of());
         }
-        String qn = request.qualifiedName().trim();
+        String qn = Names.canonical(request.qualifiedName());
         String operator = request.operator().trim();
         if (request.ops() == null || request.ops().isEmpty()) {
             return reject(qn, operator, RejectReason.INVALID_PAYLOAD,
@@ -84,8 +85,9 @@ public class CompatibilityService {
             EntityDef entity = store.getEntity(qn);
             if (entity == null) {
                 return reject(qn, operator, RejectReason.UNKNOWN_ENTITY,
-                        "实体不存在：" + qn, List.of());
+                        "实体不存在：" + qn + "（变更前请先登记）", List.of());
             }
+            // 写保护优先级统一：已废弃实体即使是 admin 也一律拒绝，原因与权限拒绝明确区分
             if (entity.isDeprecated()) {
                 return reject(qn, operator, RejectReason.ENTITY_DEPRECATED,
                         "实体 " + qn + " 已废弃，拒绝一切写操作", List.of());
@@ -105,8 +107,8 @@ public class CompatibilityService {
 
             for (ChangeFieldOp op : request.ops()) {
                 String opName = op.op() == null ? "" : op.op().trim().toUpperCase();
-                String fieldName = op.fieldName() == null ? null : op.fieldName().trim();
-                if (fieldName == null || fieldName.isEmpty()) {
+                String fieldName = Names.canonical(op.fieldName());
+                if (fieldName == null) {
                     results.add(new FieldResult(null, Decision.REJECTED, RejectReason.MISSING_FIELD_NAME,
                             "变更操作缺少字段名：" + opName));
                     continue;
@@ -141,9 +143,17 @@ public class CompatibilityService {
                                             + "，ADD 不允许隐式改类型，请使用 ALTER_TYPE"));
                         }
                     }
-                    case "DROP" -> results.add(new FieldResult(fieldName, Decision.REJECTED,
-                            RejectReason.FIELD_REMOVED_INCOMPATIBLE,
-                            "删除字段 " + fieldName + " 会使既有消费方失效，按兼容策略判定为破坏性变更"));
+                    case "DROP" -> {
+                        if (!working.containsKey(fieldName)) {
+                            results.add(new FieldResult(fieldName, Decision.REJECTED, RejectReason.UNKNOWN_FIELD,
+                                    "实体 " + qn + " 存在，但字段 " + fieldName
+                                            + " 不存在，无可删除对象（UNKNOWN_FIELD，区别于实体不存在）"));
+                        } else {
+                            results.add(new FieldResult(fieldName, Decision.REJECTED,
+                                    RejectReason.FIELD_REMOVED_INCOMPATIBLE,
+                                    "删除字段 " + fieldName + " 会使既有消费方失效，按兼容策略判定为破坏性变更"));
+                        }
+                    }
                     case "ALTER_TYPE" -> {
                         Optional<DataType> target = typeDictionary.normalize(op.rawType());
                         if (target.isEmpty()) {
@@ -153,8 +163,9 @@ public class CompatibilityService {
                         }
                         FieldDef exists = working.get(fieldName);
                         if (exists == null) {
-                            results.add(new FieldResult(fieldName, Decision.REJECTED, RejectReason.UNKNOWN_ENTITY,
-                                    "字段不存在，无法 ALTER_TYPE：" + fieldName));
+                            results.add(new FieldResult(fieldName, Decision.REJECTED, RejectReason.UNKNOWN_FIELD,
+                                    "实体 " + qn + " 存在，但字段 " + fieldName
+                                            + " 不存在，无法 ALTER_TYPE（UNKNOWN_FIELD，区别于实体不存在）"));
                             break;
                         }
                         DataType from = exists.getCanonicalType();

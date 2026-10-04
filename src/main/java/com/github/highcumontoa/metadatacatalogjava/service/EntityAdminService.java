@@ -5,14 +5,19 @@ import com.github.highcumontoa.metadatacatalogjava.model.Decision;
 import com.github.highcumontoa.metadatacatalogjava.model.EntityDef;
 import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
 import com.github.highcumontoa.metadatacatalogjava.store.LocalMetadataStore;
+import com.github.highcumontoa.metadatacatalogjava.util.Names;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
  * 实体废弃与移除服务。
- * 写操作同样经过权限校验；废弃后实体的所有登记 / 变更 / 血缘写操作均被拒绝。
- * 移除时级联清理全部关联血缘边并审计清理条数，保证无悬空血缘。
+ *
+ * <p>写保护与所有写入口保持一致：检查顺序为“必填 -&gt; 实体存在 -&gt; 已废弃 -&gt; 权限 -&gt; 业务规则”，
+ * 实体一旦废弃，包括 admin 在内的任何操作者再对其执行废弃 / 移除等写操作一律得到
+ * ENTITY_DEPRECATED（与 PERMISSION_DENIED / UNKNOWN_ENTITY 可区分）；
+ * 废弃是幂等状态：重复废弃一个已经废弃的实体同样以 ENTITY_DEPRECATED 拒绝。
+ * 移除时级联清理全部关联血缘边并审计清理条数，保证无悬空血缘。</p>
  */
 @Service
 public class EntityAdminService {
@@ -27,36 +32,37 @@ public class EntityAdminService {
         this.permissionService = permissionService;
     }
 
-    /** 标记废弃。返回 NONE 表示成功（NO_CHANGE 表示此前已废弃），否则为拒绝原因。 */
+    /** 标记废弃。返回 NONE 表示成功；否则为拒绝原因（已废弃 -> ENTITY_DEPRECATED，即使 admin 也拒绝）。 */
     public RejectReason deprecate(String operator, String qualifiedName) {
         log.info("[DEPRECATE] 输入 operator={}, qualifiedName={}", operator, qualifiedName);
         if (isBlank(operator) || isBlank(qualifiedName)) {
-            return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
+            return auditReject(ActionType.DEPRECATE_ENTITY, operator, Names.canonical(qualifiedName),
                     RejectReason.INVALID_PAYLOAD, "operator 与 qualifiedName 均为必填项");
         }
-        var lock = store.lockFor(qualifiedName);
+        String qn = Names.canonical(qualifiedName);
+        operator = operator.trim();
+        var lock = store.lockFor(qn);
         lock.lock();
         try {
-            EntityDef entity = store.getEntity(qualifiedName);
+            EntityDef entity = store.getEntity(qn);
             if (entity == null) {
-                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
-                        RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qualifiedName);
-            }
-            if (!permissionService.canWrite(qualifiedName, operator)) {
-                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
-                        RejectReason.PERMISSION_DENIED,
-                        "操作者 '" + operator + "' 对实体 " + qualifiedName + " 无修改权限");
+                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qn,
+                        RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qn);
             }
             if (entity.isDeprecated()) {
-                store.appendAudit(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
-                        Decision.NO_CHANGE, RejectReason.NONE, "实体此前已废弃，幂等返回");
-                log.info("[DEPRECATE] qualifiedName={} decision=NO_CHANGE", qualifiedName);
-                return RejectReason.NONE;
+                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qn,
+                        RejectReason.ENTITY_DEPRECATED,
+                        "实体 " + qn + " 已废弃，拒绝一切写操作（即使 admin 也不例外）");
+            }
+            if (!permissionService.canWrite(qn, operator)) {
+                return auditReject(ActionType.DEPRECATE_ENTITY, operator, qn,
+                        RejectReason.PERMISSION_DENIED,
+                        "操作者 '" + operator + "' 对实体 " + qn + " 无修改权限");
             }
             entity.markDeprecated();
-            store.appendAudit(ActionType.DEPRECATE_ENTITY, operator, qualifiedName,
+            store.appendAudit(ActionType.DEPRECATE_ENTITY, operator, qn,
                     Decision.ACCEPTED, RejectReason.NONE, "实体已标记废弃，此后一切写操作将被拒绝");
-            log.info("[DEPRECATE] qualifiedName={} decision=ACCEPTED", qualifiedName);
+            log.info("[DEPRECATE] qualifiedName={} decision=ACCEPTED", qn);
             return RejectReason.NONE;
         } finally {
             lock.unlock();
@@ -67,29 +73,36 @@ public class EntityAdminService {
     public RejectReason remove(String operator, String qualifiedName) {
         log.info("[REMOVE] 输入 operator={}, qualifiedName={}", operator, qualifiedName);
         if (isBlank(operator) || isBlank(qualifiedName)) {
-            return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
+            return auditReject(ActionType.REMOVE_ENTITY, operator, Names.canonical(qualifiedName),
                     RejectReason.INVALID_PAYLOAD, "operator 与 qualifiedName 均为必填项");
         }
-        var entityLock = store.lockFor(qualifiedName);
+        String qn = Names.canonical(qualifiedName);
+        operator = operator.trim();
+        var entityLock = store.lockFor(qn);
         // 固定加锁顺序：先实体锁后血缘锁，避免与血缘登记路径互相等待
         entityLock.lock();
         store.lineageLock().lock();
         try {
-            EntityDef entity = store.getEntity(qualifiedName);
+            EntityDef entity = store.getEntity(qn);
             if (entity == null) {
-                return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
-                        RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qualifiedName);
+                return auditReject(ActionType.REMOVE_ENTITY, operator, qn,
+                        RejectReason.UNKNOWN_ENTITY, "实体不存在：" + qn);
             }
-            if (!permissionService.canWrite(qualifiedName, operator)) {
-                return auditReject(ActionType.REMOVE_ENTITY, operator, qualifiedName,
+            if (entity.isDeprecated()) {
+                return auditReject(ActionType.REMOVE_ENTITY, operator, qn,
+                        RejectReason.ENTITY_DEPRECATED,
+                        "实体 " + qn + " 已废弃，拒绝一切写操作（包括移除，即使 admin 也不例外）");
+            }
+            if (!permissionService.canWrite(qn, operator)) {
+                return auditReject(ActionType.REMOVE_ENTITY, operator, qn,
                         RejectReason.PERMISSION_DENIED,
-                        "操作者 '" + operator + "' 对实体 " + qualifiedName + " 无修改权限");
+                        "操作者 '" + operator + "' 对实体 " + qn + " 无修改权限");
             }
-            int cleaned = store.removeEntityAndLineage(qualifiedName);
-            store.appendAudit(ActionType.REMOVE_ENTITY, operator, qualifiedName,
+            int cleaned = store.removeEntityAndLineage(qn);
+            store.appendAudit(ActionType.REMOVE_ENTITY, operator, qn,
                     Decision.ACCEPTED, RejectReason.NONE,
                     "实体已移除，并级联清理血缘边 " + cleaned + " 条，无悬空血缘");
-            log.info("[REMOVE] qualifiedName={} decision=ACCEPTED cleanedEdges={}", qualifiedName, cleaned);
+            log.info("[REMOVE] qualifiedName={} decision=ACCEPTED cleanedEdges={}", qn, cleaned);
             return RejectReason.NONE;
         } finally {
             store.lineageLock().unlock();

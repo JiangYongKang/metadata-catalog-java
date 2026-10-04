@@ -6,6 +6,7 @@ import com.github.highcumontoa.metadatacatalogjava.model.Decision;
 import com.github.highcumontoa.metadatacatalogjava.model.EntityDef;
 import com.github.highcumontoa.metadatacatalogjava.model.LineageEdge;
 import com.github.highcumontoa.metadatacatalogjava.model.RejectReason;
+import com.github.highcumontoa.metadatacatalogjava.util.Names;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -50,13 +51,13 @@ public class LocalMetadataStore {
         return upstream + "->" + downstream;
     }
 
-    /** 获取实体级锁，串行化针对同一实体的写操作。 */
+    /** 获取实体级锁，串行化针对同一实体的写操作。按规范键取锁，书写差异不会各取一把锁。 */
     public Lock lockFor(String qualifiedName) {
-        return entityLocks.computeIfAbsent(qualifiedName, k -> new ReentrantLock());
+        return entityLocks.computeIfAbsent(Names.canonical(qualifiedName), k -> new ReentrantLock());
     }
 
     public EntityDef getEntity(String qualifiedName) {
-        return entities.get(qualifiedName);
+        return entities.get(Names.canonical(qualifiedName));
     }
 
     public Map<String, EntityDef> allEntities() {
@@ -64,7 +65,7 @@ public class LocalMetadataStore {
     }
 
     public void putEntity(EntityDef entity) {
-        entities.put(entity.getQualifiedName(), entity);
+        entities.put(Names.canonical(entity.getQualifiedName()), entity);
     }
 
     // ---- 血缘 ----
@@ -154,10 +155,11 @@ public class LocalMetadataStore {
     }
 
     public List<AuditRecord> auditTrail(String qualifiedName) {
+        String qn = Names.canonical(qualifiedName);
         auditLock.lock();
         try {
             return auditLog.values().stream()
-                    .filter(r -> r.targetEntity() != null && r.targetEntity().equals(qualifiedName))
+                    .filter(r -> r.targetEntity() != null && r.targetEntity().equals(qn))
                     .toList();
         } finally {
             auditLock.unlock();
