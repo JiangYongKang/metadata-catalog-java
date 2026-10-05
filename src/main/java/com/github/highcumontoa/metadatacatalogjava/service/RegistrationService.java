@@ -45,6 +45,11 @@ import java.util.HashSet;
  *   <li>新实体 -&gt; ACCEPTED；既有实体补充新字段 / 新来源 / 裁决取代 -&gt; MERGED；
  *       声明完全一致 -&gt; NO_CHANGE；</li>
  *   <li>同实体的并发登记通过实体锁串行化，配合确定性裁决保证收敛一致；</li>
+ *   <li>实体的来源清单与每个来源的最终去向（{@code EntityDef#getSources()} /
+ *       {@code EntityDef#getSourceOutcomes()}）从实体最终状态确定性推导：
+ *       生效来源必在清单中；被取代来源以 SUPERSEDED 记在来源去向里（原始声明见字段拒绝台账）；
+ *       批次级拒绝（种类不符 / 已废弃 / 无权限）的来源以 REJECTED 记录——
+ *       与到达顺序、并发调度无关，不会出现"同一来源有时算进去、有时算不进去"；</li>
  *   <li>无权限 / 已废弃实体分别以 PERMISSION_DENIED、ENTITY_DEPRECATED 拒绝，不留歧义。</li>
  * </ol>
  */
@@ -103,14 +108,20 @@ public class RegistrationService {
             EntityDef existing = store.getEntity(qn);
 
             if (existing != null && existing.isDeprecated()) {
+                // 批次级拒绝记录在实体上（仅交代去向，不改规范数据），保证该来源去向可查询
+                existing.markRejected(source);
                 return rejectGlobal(request, RejectReason.ENTITY_DEPRECATED,
                         "实体 " + qn + " 已废弃，拒绝登记", List.of());
             }
             if (!permissionService.canWrite(qn, source)) {
+                if (existing != null) {
+                    existing.markRejected(source);
+                }
                 return rejectGlobal(request, RejectReason.PERMISSION_DENIED,
                         "来源/操作者 '" + source + "' 对实体 " + qn + " 无登记权限", List.of());
             }
             if (existing != null && existing.getKind() != kind) {
+                existing.markRejected(source);
                 return rejectGlobal(request, RejectReason.KIND_CONFLICT,
                         "实体 " + qn + " 已登记为 " + existing.getKind()
                                 + "，本次声明为 " + kind + "，种类不符，拒绝合并", List.of());
@@ -233,7 +244,7 @@ public class RegistrationService {
                 }
             }
 
-            entity.addSource(source);
+            entity.markRegistered(source);
             if (isNew) {
                 store.putEntity(entity);
             }
@@ -256,7 +267,8 @@ public class RegistrationService {
             RegistrationResult result = new RegistrationResult(qn, decision, RejectReason.NONE,
                     message, Arrays.asList(fieldResults));
             store.appendAudit(ActionType.REGISTER_ENTITY, source, qn, decision, RejectReason.NONE, message);
-            log.info("[REGISTER] 结论 qualifiedName={}, decision={}, 依据={}", qn, decision, message);
+            log.info("[REGISTER] 结论 qualifiedName={}, decision={}, 来源 {} 去向={}, 依据={}",
+                    qn, decision, source, entity.getSourceOutcomes().get(source), message);
             return result;
         } finally {
             lock.unlock();
@@ -280,8 +292,11 @@ public class RegistrationService {
                 primaryReason(nonNull), message, nonNull);
         store.appendAudit(ActionType.REGISTER_ENTITY, source, qn, Decision.REJECTED,
                 primaryReason(nonNull), message + " | 字段级结论=" + nonNull);
-        log.info("[REGISTER] 结论 qualifiedName={}, decision=REJECTED, 依据={} | 字段级结论={}",
-                qn, message, nonNull);
+        EntityDef entity = store.getEntity(qn);
+        Object disposition = entity == null ? "（实体未建立，去向见本结论与审计）"
+                : entity.getSourceOutcomes().get(source);
+        log.info("[REGISTER] 结论 qualifiedName={}, decision=REJECTED, 来源 {} 去向={}, 依据={} | 字段级结论={}",
+                qn, source, disposition, message, nonNull);
         return result;
     }
 

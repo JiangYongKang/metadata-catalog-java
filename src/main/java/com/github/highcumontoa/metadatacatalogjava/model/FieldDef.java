@@ -3,6 +3,7 @@ package com.github.highcumontoa.metadatacatalogjava.model;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * 统一模型中的字段定义。
@@ -39,8 +40,17 @@ public final class FieldDef {
 
     public String getName() { return name; }
     public DataType getCanonicalType() { return canonicalType; }
-    public Map<String, String> getSources() { return Collections.unmodifiableMap(sources); }
-    public Map<String, String> getRejectedClaims() { return Collections.unmodifiableMap(rejectedClaims); }
+
+    /** 生效来源（来源 -> 原始类型），按来源名排序：展示 / 序列化结果与声明到达顺序无关。 */
+    public Map<String, String> getSources() {
+        return Collections.unmodifiableMap(new TreeMap<>(sources));
+    }
+
+    /** 拒绝台账（落败来源 -> 原始类型），按来源名排序：展示 / 序列化结果与声明到达顺序无关。 */
+    public Map<String, String> getRejectedClaims() {
+        return Collections.unmodifiableMap(new TreeMap<>(rejectedClaims));
+    }
+
     public boolean isDeprecated() { return deprecated; }
 
     /** 追加一个生效来源；若该来源此前在拒绝台账中，则移除（最终去向以生效为准）。 */

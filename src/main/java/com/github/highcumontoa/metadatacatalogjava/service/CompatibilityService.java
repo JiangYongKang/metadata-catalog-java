@@ -185,10 +185,13 @@ public class CompatibilityService {
                             pendingMutations.add(() -> {
                                 Map<String, String> src = new LinkedHashMap<>(exists.getSources());
                                 src.put(operator, op.rawType().trim());
-                                entity.putField(new FieldDef(fieldName, t, src, exists.isDeprecated()));
+                                // 保留拒绝台账：被取代来源的去向不随类型放宽而丢失
+                                entity.putField(new FieldDef(fieldName, t, src,
+                                        exists.getRejectedClaims(), exists.isDeprecated()));
                             });
                             working.put(fieldName, new FieldDef(fieldName, to,
-                                    new LinkedHashMap<>(exists.getSources()), exists.isDeprecated()));
+                                    new LinkedHashMap<>(exists.getSources()),
+                                    exists.getRejectedClaims(), exists.isDeprecated()));
                             anyChange = true;
                         } else {
                             results.add(new FieldResult(fieldName, Decision.REJECTED,

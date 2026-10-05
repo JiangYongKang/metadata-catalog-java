@@ -18,8 +18,9 @@
 
 | 类型 | 含义 |
 | --- | --- |
-| `EntityDef` | 实体，按 **qualifiedName（限定名）** 归一；种类为 `TABLE / VIEW / STREAM`；持有字段集合、声明来源集合、`deprecated` 标志 |
-| `FieldDef` | 字段：`name`、**canonicalType（规范类型）**、`sources`（生效来源 -> 其原始类型）、`rejectedClaims`（拒绝台账：落败来源 -> 其原始类型）、`deprecated` |
+| `EntityDef` | 实体，按 **qualifiedName（限定名）** 归一；种类为 `TABLE / VIEW / STREAM`；持有字段集合、`deprecated` 标志；**来源清单（`getSources()`）与每个来源的最终去向（`getSourceOutcomes()`）从最终状态确定性推导**（见 1.2.2） |
+| `FieldDef` | 字段：`name`、**canonicalType（规范类型）**、`sources`（生效来源 -> 其原始类型）、`rejectedClaims`（拒绝台账：落败来源 -> 其原始类型）、`deprecated`；两个 map 均按来源名排序输出 |
+| `SourceDisposition` | 来源最终去向枚举：`EFFECTIVE`（合并生效）/ `SUPERSEDED`（被取代）/ `REJECTED`（被拒绝） |
 | `DataType` | 统一规范类型枚举：`INTEGER / BIGINT / DECIMAL / DOUBLE / STRING / BOOLEAN / TIMESTAMP` |
 | `LineageEdge` | 有向血缘记录 `(upstream, downstream, source)` |
 | `AuditRecord` | 只追加审计：单调序号、时间戳、动作、操作者、目标实体、结论、拒绝原因、明细 |
@@ -73,6 +74,30 @@
 不是"谁先到谁说了算"。每个来源的最终去向可从字段状态直接查询：
 在 `sources` 中 = 生效合并；在 `rejectedClaims` 中 = 被 `TYPE_CONFLICT` 拒绝 / 取代。
 
+#### 1.2.2 实体来源清单与来源去向的收敛（`EntityDef.getSources()` / `getSourceOutcomes()`）
+
+实体携带一份"哪些来源声明过本实体"的**来源清单**，以及每个来源的**最终去向**。
+两者都不是按到达先后增量叠加的，而是从实体最终状态**确定性推导**，
+因此与提交顺序、并发调度完全无关——不会出现"同一来源有时算进去、有时算不进去"：
+
+| 最终去向 | 判定依据（按优先级依次判定） |
+| --- | --- |
+| `EFFECTIVE`（合并生效） | 该来源在任一字段的生效声明 `sources` 中；或成功登记过且没有任何声明落入拒绝台账（如零字段登记） |
+| `SUPERSEDED`（被取代） | 无生效声明，但在任一字段的拒绝台账 `rejectedClaims` 中（类型裁决落败——无论先到后被取代、还是后到被拒，最终一致） |
+| `REJECTED`（被拒绝） | 无生效声明、无台账记录，但批次因实体状态原因（`KIND_CONFLICT` / `ENTITY_DEPRECATED` / `PERMISSION_DENIED`）被整体拒绝 |
+
+- `getSources()`（来源清单）= 去向为 `EFFECTIVE` 的来源集合，按来源名排序；
+  **生效、参与合并的来源必然在清单中，被取代 / 被拒绝的来源必然不在**；
+- 清单与去向必然互相对得上：清单 = 去向为 EFFECTIVE 的来源，二者由同一份状态推导；
+- 被取代来源的原始声明在对应字段的 `rejectedClaims` 台账中可查；
+  被拒绝批次的逐条结论与原因在登记结果与审计日志中可查；
+  输入级非法（`INVALID_PAYLOAD` / `UNKNOWN_TYPE` 等）的批次与实体状态无关、
+  每次提交结论都相同，其去向以逐条结论与审计为准；
+- 被取代 / 被拒绝的来源改以符合规范的类型重新登记后，去向翻转为 `EFFECTIVE`，
+  台账中的记录同步清除（最终去向以生效为准）；
+- 实体字段集合、字段的生效来源与拒绝台账在输出时均按名称排序，
+  目录对外给出的结果不随提交顺序变化。
+
 ### 1.3 并发确定性
 
 - 每个实体一把锁（`LocalMetadataStore.lockFor`），同一实体的并发登记 / 变更被串行化，
@@ -80,6 +105,10 @@
 - 同字段冲突类型并发提交时，按固定类型优先级裁决：无论线程如何调度，
   收敛到同一个规范类型、同一组生效来源与拒绝台账
   （见 `RegistrationServiceTest` 与 `NormalizationConvergenceTest` 的多轮压测）；
+- 实体来源清单与每个来源的最终去向同样收敛：并发混合提交（一部分类型互相冲突、
+  一部分类型相同、实体名仅大小写 / 首尾空白不同）多轮重复，
+  最终来源清单、`EFFECTIVE / SUPERSEDED / REJECTED` 去向完全一致
+  （见 `SourceListConvergenceTest`）；
 - 血缘的环检测与写入在同一把血缘锁内完成；删除实体遵循“先实体锁后血缘锁”的固定加锁顺序，避免死锁。
 
 ---
@@ -114,6 +143,7 @@
 | `ALTER_TYPE` 已存在字段 | 仅允许**数值放宽**：`INTEGER→BIGINT/DECIMAL/DOUBLE`、`BIGINT→DECIMAL/DOUBLE`；相同类型视为无效变更；其余（收窄 / 跨族类）→ `TYPE_CHANGE_INCOMPATIBLE` |
 
 每条操作都在响应 `opResults` 中给出独立的字段名、结论、原因与文字依据。
+`ALTER_TYPE` 放宽落库时保留字段的拒绝台账，被取代来源的去向不随类型放宽而丢失。
 
 ### 3.1 废弃与权限（写保护，所有入口一致，原因可区分）
 
@@ -214,16 +244,23 @@ curl -s "localhost:8080/api/catalog/audit?qualifiedName=ods.user"
 mvn test
 ```
 
-共 35 个测试，全部无外部依赖、全部在本地完成：
+共 39 个测试，全部无外部依赖、全部在本地完成：
 
+- `SourceListConvergenceTest`（4，本次新增）：**来源清单与来源去向的收敛**——
+  同一组冲突声明打乱 12 种顺序提交、8 线程 × 20 轮并发混合提交
+  （类型互相冲突 + 类型相同 + 实体名大小写 / 首尾空白变体）、
+  多字段来源部分被取代的 6 种顺序，逐轮断言实体种类、字段规范定义、
+  实体来源清单、每个来源的 `EFFECTIVE / SUPERSEDED / REJECTED` 去向
+  与完整状态快照完全一致；并验证三类去向可查询、与来源清单互相对得上、
+  被取代来源重新合规登记后翻转为生效；
 - `RegistrationServiceTest`（7）：归一合并、幂等、非法 / 缺失 / 批次重复字段、
   类型冲突、16 线程并发相同声明、**12 线程 × 20 轮并发冲突类型的收敛一致性**
   （每轮规范类型、生效来源、拒绝台账完全相同）；
-- `NormalizationConvergenceTest`（6，新增）：书写差异（大小写 / 首尾空白）在登记 / 变更 /
+- `NormalizationConvergenceTest`（6）：书写差异（大小写 / 首尾空白）在登记 / 变更 /
   血缘 / 废弃入口归一到同一对象；裁决取代可解释；**10 轮乱序提交**与
   **8 线程 × 20 轮并发混合声明**最终状态与调度无关；种类不一致 `KIND_CONFLICT`；
   混合批次整体不落库且既有数据不被污染；
-- `WriteProtectionConsistencyTest`（3，新增）：已废弃实体五个写入口统一
+- `WriteProtectionConsistencyTest`（3）：已废弃实体五个写入口统一
   `ENTITY_DEPRECATED`；只读（白名单外）操作者五个写入口统一 `PERMISSION_DENIED`；
   `UNKNOWN_ENTITY` 与 `UNKNOWN_FIELD` / `UNKNOWN_TYPE` / `PERMISSION_DENIED` 明确区分；
 - `LineageServiceTest`（7）：自引用、成环（附路径）、重复与并发重复不计数、
@@ -234,14 +271,19 @@ mvn test
 - `ApplicationTests`（1）：Spring 上下文加载。
 
 测试与服务日志使用 `[REGISTER] / [LINEAGE] / [IMPACT] / [CHANGE] / [DEPRECATE] / [REMOVE]`
-前缀，**打印每次输入与判定依据（含逐字段 / 逐操作结论、裁决优先级、成环路径）**，
+前缀，**打印每次输入与判定依据（含逐字段 / 逐操作结论、裁决优先级、来源去向、成环路径）**，
 便于人工核对。
 
 ### 6.1 兼容范围
 
 - 归一仅覆盖**对象名书写差异**（大小写、首尾空白）与**类型字典内别名**
   （如 `varchar`/`text` → `STRING`）；不做语义级匹配（如同义词、命名风格转换）；
-- 种类（TABLE / VIEW / STREAM）不参与归一合并：同名不同种类一律 `KIND_CONFLICT` 拒绝；
+- 种类（TABLE / VIEW / STREAM）不参与归一合并：同名不同种类一律 `KIND_CONFLICT` 拒绝
+  （保持"先到建档、后来拒绝"的既有边界，不属于收敛保证的范围）；
+- 来源清单与来源去向的收敛保证针对**同一实体的合法声明集合**（含互相冲突的类型声明、
+  书写变体、任意并发混合）；混合批次"整批拒绝"的既有边界不变——
+  批次内同时含合法新字段与冲突字段时，该批次整体不落库（见
+  `NormalizationConvergenceTest.mixedBatchRejectedAtomicallyWithoutPollution`）；
 - 类型裁决只在**同一字段的多种规范类型声明**之间进行；`ALTER_TYPE` 变更仍按
   第 3 节的放宽白名单判定，两套规则互不影响；
 - 全部状态保存在进程内存中，重启即清空；不依赖任何外部服务。
