@@ -44,6 +44,10 @@ import java.util.HashSet;
  *       同一组声明的最终规范定义与每个来源的去向完全一致；</li>
  *   <li>新实体 -&gt; ACCEPTED；既有实体补充新字段 / 新来源 / 裁决取代 -&gt; MERGED；
  *       声明完全一致 -&gt; NO_CHANGE；</li>
+ *   <li>实体来源清单是派生值（{@link EntityDef#getSources()}）：实体级声明来源
+ *       ∪ 所有字段当前生效来源。被取代 / 被拒绝的来源不留在清单中，其去向可从
+ *       字段级拒绝台账（rejectedClaims）与审计轨迹明确查询，因此来源清单与每个
+ *       来源的最终去向（生效 / 被拒 / 被取代）一一对应，且与到达顺序无关；</li>
  *   <li>同实体的并发登记通过实体锁串行化，配合确定性裁决保证收敛一致；</li>
  *   <li>无权限 / 已废弃实体分别以 PERMISSION_DENIED、ENTITY_DEPRECATED 拒绝，不留歧义。</li>
  * </ol>
@@ -233,7 +237,13 @@ public class RegistrationService {
                 }
             }
 
-            entity.addSource(source);
+            // 实体来源清单是派生值（EntityDef.getSources）：字段级生效来源随 putField 自动并入；
+            // 仅零字段批次（只声明实体本身）需要显式记录实体级声明来源。
+            // 被取代 / 被拒绝的来源不进入清单，其去向见字段级拒绝台账与审计——
+            // 因此同一组声明无论到达顺序与并发调度如何，来源清单收敛到同一集合。
+            if (claims.isEmpty()) {
+                entity.addDeclaredSource(source);
+            }
             if (isNew) {
                 store.putEntity(entity);
             }

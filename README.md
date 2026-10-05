@@ -18,7 +18,7 @@
 
 | 类型 | 含义 |
 | --- | --- |
-| `EntityDef` | 实体，按 **qualifiedName（限定名）** 归一；种类为 `TABLE / VIEW / STREAM`；持有字段集合、声明来源集合、`deprecated` 标志 |
+| `EntityDef` | 实体，按 **qualifiedName（限定名）** 归一；种类为 `TABLE / VIEW / STREAM`；持有字段集合、`deprecated` 标志；**来源清单为派生值**（见 1.2.2） |
 | `FieldDef` | 字段：`name`、**canonicalType（规范类型）**、`sources`（生效来源 -> 其原始类型）、`rejectedClaims`（拒绝台账：落败来源 -> 其原始类型）、`deprecated` |
 | `DataType` | 统一规范类型枚举：`INTEGER / BIGINT / DECIMAL / DOUBLE / STRING / BOOLEAN / TIMESTAMP` |
 | `LineageEdge` | 有向血缘记录 `(upstream, downstream, source)` |
@@ -73,6 +73,26 @@
 不是"谁先到谁说了算"。每个来源的最终去向可从字段状态直接查询：
 在 `sources` 中 = 生效合并；在 `rejectedClaims` 中 = 被 `TYPE_CONFLICT` 拒绝 / 取代。
 
+#### 1.2.2 实体来源清单的收敛规则（`EntityDef.getSources()`）
+
+实体携带的"哪些来源声明过本实体"清单是**派生值**，不是独立累积的状态：
+
+```
+实体来源清单 = 实体级声明来源（零字段批次被接受的来源） ∪ 所有字段当前生效来源
+```
+
+- **最终生效、参与合并的来源必然在清单中**：凡是被接受的字段声明，
+  其来源一定落在某个字段的 `sources` 里，随之并入实体清单；
+- **被裁决取代 / 被拒绝的来源不留在清单中**：取代发生时来源从字段 `sources`
+  移入 `rejectedClaims`，实体清单随之自动收敛；被拒绝的批次本就不落库，
+  不会进入清单。这些来源的去向可从字段级 `rejectedClaims` 拒绝台账与审计轨迹
+  明确查到，与清单一一对应、不重复不遗漏；
+- 因为清单只依赖**最终状态**（各字段当前生效来源），与声明到达顺序、并发调度
+  完全无关：同一组声明无论以什么顺序提交、多少并发，实体来源清单必然收敛到
+  同一个集合（修复前该清单独立累积，取代发生后不清理，导致顺序不同结果不同——
+  有时只剩一个来源、有时留下好几个）；
+- 清单输出按字典序排序，与字段落库先后无关，保证多次读取结果稳定。
+
 ### 1.3 并发确定性
 
 - 每个实体一把锁（`LocalMetadataStore.lockFor`），同一实体的并发登记 / 变更被串行化，
@@ -80,6 +100,8 @@
 - 同字段冲突类型并发提交时，按固定类型优先级裁决：无论线程如何调度，
   收敛到同一个规范类型、同一组生效来源与拒绝台账
   （见 `RegistrationServiceTest` 与 `NormalizationConvergenceTest` 的多轮压测）；
+- 实体来源清单是最终状态的派生值（见 1.2.2），乱序 / 并发下与每个来源的去向
+  同步收敛（见 `SourceListConvergenceTest` 的 12 种乱序 × 20 轮并发验证）；
 - 血缘的环检测与写入在同一把血缘锁内完成；删除实体遵循“先实体锁后血缘锁”的固定加锁顺序，避免死锁。
 
 ---
@@ -214,16 +236,21 @@ curl -s "localhost:8080/api/catalog/audit?qualifiedName=ods.user"
 mvn test
 ```
 
-共 35 个测试，全部无外部依赖、全部在本地完成：
+共 39 个测试，全部无外部依赖、全部在本地完成：
 
 - `RegistrationServiceTest`（7）：归一合并、幂等、非法 / 缺失 / 批次重复字段、
   类型冲突、16 线程并发相同声明、**12 线程 × 20 轮并发冲突类型的收敛一致性**
   （每轮规范类型、生效来源、拒绝台账完全相同）；
-- `NormalizationConvergenceTest`（6，新增）：书写差异（大小写 / 首尾空白）在登记 / 变更 /
+- `NormalizationConvergenceTest`（6）：书写差异（大小写 / 首尾空白）在登记 / 变更 /
   血缘 / 废弃入口归一到同一对象；裁决取代可解释；**10 轮乱序提交**与
   **8 线程 × 20 轮并发混合声明**最终状态与调度无关；种类不一致 `KIND_CONFLICT`；
   混合批次整体不落库且既有数据不被污染；
-- `WriteProtectionConsistencyTest`（3，新增）：已废弃实体五个写入口统一
+- `SourceListConvergenceTest`（4，本次新增）：**实体来源清单与每个来源去向的收敛**——
+  同一组冲突 + 相同类型 + 书写变体声明打乱 12 种顺序逐遍提交、8 线程 × 20 轮并发
+  混合提交，断言各轮的实体种类、字段规范定义、生效 / 被拒来源去向、实体来源清单
+  完全一致；最小复现（两份冲突声明两种顺序）证明逐请求结论可不同但最终状态一致；
+  零字段批次的实体级声明来源同样收敛；
+- `WriteProtectionConsistencyTest`（3）：已废弃实体五个写入口统一
   `ENTITY_DEPRECATED`；只读（白名单外）操作者五个写入口统一 `PERMISSION_DENIED`；
   `UNKNOWN_ENTITY` 与 `UNKNOWN_FIELD` / `UNKNOWN_TYPE` / `PERMISSION_DENIED` 明确区分；
 - `LineageServiceTest`（7）：自引用、成环（附路径）、重复与并发重复不计数、
